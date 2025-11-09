@@ -2,5 +2,6 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 Pillow==10.4.0
 pydantic==2.9.2
-vllm==0.6.0.post1  # or latest nightly; ensure it matches your CUDA/Torch build
+# Pick a real vLLM version; these work well with CUDA 12.x:
+vllm>=0.9.0,<0.12
 
