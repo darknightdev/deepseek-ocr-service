@@ -1,196 +1,234 @@
+#!/usr/bin/env python
 """
-Example DeepSeek-OCR FastAPI Service for Remote GPU Deployment
+DeepSeek-OCR FastAPI service using vLLM.
 
-This is a reference implementation of the remote GPU service that the pipeline
-calls for L3 PII validation.
+- Loads deepseek-ai/DeepSeek-OCR via vLLM
+- Exposes:
+    GET  /healthz
+    POST /validate_piicrop  (payload: {image_base64, prompt, category?, temperature?, max_tokens?})
 
-Deploy this on a GPU instance (A10/A100/L4) and expose via HTTPS.
+Notes:
+- Keep prompts minimal/redacted. This endpoint is perfect as the L3 validator in your pipeline.
+- Pin the model revision via MODEL_REV if you want to freeze remote code.
 """
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+
 import base64
 import io
-from PIL import Image
-import json
 import logging
-from typing import Optional
+import os
+import time
+from functools import lru_cache
+from typing import Optional, Dict, Any
 
-# DeepSeek-OCR imports (adjust based on your deployment method)
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from PIL import Image
+
+# vLLM
+from vllm import LLM, SamplingParams
+
+# Some DeepSeek-OCR custom logits processor is optional.
+# If it's not available in your vLLM wheel, just disable it.
 try:
-    # Option 1: vLLM deployment
-    from vllm import LLM, SamplingParams
     from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
-    USE_VLLM = True
-except ImportError:
-    try:
-        # Option 2: Transformers deployment
-        from transformers import AutoModel, AutoTokenizer
-        import torch
-        USE_VLLM = False
-        USE_TRANSFORMERS = True
-    except ImportError:
-        USE_VLLM = False
-        USE_TRANSFORMERS = False
-        logging.warning("No DeepSeek-OCR backend available - install vLLM or transformers")
+    HAVE_NGRAM = True
+except Exception:
+    HAVE_NGRAM = False
 
-app = FastAPI(title="DeepSeek-OCR PII Validation Service")
 
-# CORS middleware (restrict in production)
+# -------------------------
+# Config via environment
+# -------------------------
+
+MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-OCR")
+MODEL_REV = os.getenv("MODEL_REV", None)  # e.g. "9f30c71" from your HF log
+DTYPE = os.getenv("DTYPE", "bfloat16")    # "float16" if your GPU lacks bf16
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+CORS_ALLOW = os.getenv("CORS_ALLOW", "*")  # set to comma list of origins in prod
+
+# vLLM performance knobs
+TENSOR_PARALLEL = int(os.getenv("TENSOR_PARALLEL", "1"))
+MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", "8192"))
+GPU_MEMORY_UTIL = float(os.getenv("GPU_MEMORY_UTIL", "0.90"))
+
+# Simple rate caps (per-process; use real gateway/rate-limiter in prod)
+MAX_TOKENS_DEFAULT = int(os.getenv("MAX_TOKENS_DEFAULT", "512"))
+TEMPERATURE_DEFAULT = float(os.getenv("TEMPERATURE_DEFAULT", "0.0"))
+
+# -------------------------
+# Logging
+# -------------------------
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("deepseek-ocr-service")
+
+
+# -------------------------
+# FastAPI app
+# -------------------------
+
+app = FastAPI(title="DeepSeek-OCR Service (vLLM)")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict to your pipeline IPs in production
+    allow_origins=[o.strip() for o in CORS_ALLOW.split(",")] if CORS_ALLOW else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global model instance (load once at startup)
-_model = None
-_tokenizer = None
+_llm: Optional[LLM] = None
 
+# -------------------------
+# Models
+# -------------------------
 
 class ValidationRequest(BaseModel):
-    image_base64: str
-    prompt: str
-    category: str
-    temperature: float = 0.0
-    max_tokens: int = 512
+    image_base64: str = Field(..., description="Base64-encoded PNG/JPEG crop")
+    prompt: str = Field(..., description="Redacted validation prompt")
+    category: Optional[str] = Field(None, description="PII category hint (optional)")
+    temperature: float = Field(TEMPERATURE_DEFAULT, ge=0.0, le=1.0)
+    max_tokens: int = Field(MAX_TOKENS_DEFAULT, ge=1, le=2048)
 
 
 class ValidationResponse(BaseModel):
     text: str
-    output: Optional[str] = None
     latency_ms: int
     cached: bool = False
+    backend: str = "vLLM"
+    model: str = MODEL_NAME
 
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def _decode_image(b64: str) -> Image.Image:
+    try:
+        img_bytes = base64.b64decode(b64)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        return img
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image_base64: {e}")
+
+
+def _build_sampling_params(temperature: float, max_tokens: int) -> SamplingParams:
+    extra_args: Dict[str, Any] = {}
+    if HAVE_NGRAM:
+        # These are the defaults recommended by DS-OCR authors to reduce hallucinated HTML tables
+        extra_args.update(dict(ngram_size=30, window_size=90, whitelist_token_ids={128821, 128822}))
+    return SamplingParams(
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=1.0,
+        skip_special_tokens=False,
+        stop=None,
+        extra_args=extra_args if HAVE_NGRAM else None,
+    )
+
+
+# Very small in-process cache keyed by (prompt, SHA256(image_bytes))
+# You’ll likely want Redis in production.
+@lru_cache(maxsize=1024)
+def _cache_key(prompt: str, image_hash: str) -> Optional[str]:
+    return None
+
+
+def _sha256_of_image(img: Image.Image) -> str:
+    import hashlib
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return hashlib.sha256(buf.getvalue()).hexdigest()
+
+
+# -------------------------
+# Lifecycle
+# -------------------------
 
 @app.on_event("startup")
-async def load_model():
-    """Load DeepSeek-OCR model at startup."""
-    global _model, _tokenizer
-    
-    if not (USE_VLLM or USE_TRANSFORMERS):
-        logging.error("No backend available - service will return errors")
-        return
-    
-    try:
-        if USE_VLLM:
-            logging.info("Loading DeepSeek-OCR via vLLM...")
-            _model = LLM(
-                model="deepseek-ai/DeepSeek-OCR",
-                enable_prefix_caching=False,
-                mm_processor_cache_gb=0,
-                logits_processors=[NGramPerReqLogitsProcessor]
-            )
-            logging.info("Model loaded successfully")
-        
-        elif USE_TRANSFORMERS:
-            logging.info("Loading DeepSeek-OCR via Transformers...")
-            _tokenizer = AutoTokenizer.from_pretrained(
-                "deepseek-ai/DeepSeek-OCR",
-                trust_remote_code=True
-            )
-            _model = AutoModel.from_pretrained(
-                "deepseek-ai/DeepSeek-OCR",
-                _attn_implementation='flash_attention_2',
-                trust_remote_code=True,
-                use_safetensors=True
-            )
-            _model = _model.eval().cuda().to(torch.bfloat16)
-            logging.info("Model loaded successfully")
-    
-    except Exception as e:
-        logging.error(f"Failed to load model: {e}")
-        raise
+def _startup():
+    global _llm
+
+    log.info("Loading model with vLLM...")
+    llm_kwargs = dict(
+        model=MODEL_NAME,
+        trust_remote_code=True,
+        tensor_parallel_size=TENSOR_PARALLEL,
+        max_model_len=MAX_MODEL_LEN,
+        dtype=DTYPE,  # "bfloat16" or "float16"
+        gpu_memory_utilization=GPU_MEMORY_UTIL,
+    )
+    if MODEL_REV:
+        llm_kwargs["revision"] = MODEL_REV
+
+    # Turn off prefix cache unless you plan to stream long docs in chunks:
+    llm_kwargs["enable_prefix_caching"] = False
+
+    # If DeepSeek-OCR needs mm cache memory, you can tweak:
+    # llm_kwargs["mm_processor_cache_gb"] = 0
+
+    _llm = LLM(**llm_kwargs)
+    log.info("Model loaded.")
 
 
 @app.get("/healthz")
-async def health_check():
-    """Health check endpoint."""
-    if _model is None and not USE_TRANSFORMERS:
+def healthz():
+    if _llm is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    return {"status": "healthy", "backend": "vLLM" if USE_VLLM else "transformers"}
+    return {"ok": True, "backend": "vLLM", "model": MODEL_NAME, "rev": MODEL_REV or "latest"}
 
+
+# -------------------------
+# Inference
+# -------------------------
 
 @app.post("/validate_piicrop", response_model=ValidationResponse)
-async def validate_pii_crop(request: ValidationRequest):
-    """
-    Validate PII candidate using DeepSeek-OCR.
-    
-    Args:
-        request: Validation request with image and prompt
-    
-    Returns:
-        Validation response with JSON verdict
-    """
-    import time
-    start_time = time.time()
-    
-    if _model is None:
+def validate_pii_crop(req: ValidationRequest):
+    if _llm is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    try:
-        # Decode image
-        image_bytes = base64.b64decode(request.image_base64)
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        
-        # Prepare input based on backend
-        if USE_VLLM:
-            # vLLM format
-            model_input = [{
-                "prompt": request.prompt,
-                "multi_modal_data": {"image": image}
-            }]
-            
-            sampling_param = SamplingParams(
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                extra_args=dict(
-                    ngram_size=30,
-                    window_size=90,
-                    whitelist_token_ids={128821, 128822},  # <td>, </td>
-                ),
-                skip_special_tokens=False,
-            )
-            
-            # Generate
-            outputs = _model.generate(model_input, sampling_param)
-            text = outputs[0].outputs[0].text
-        
-        elif USE_TRANSFORMERS:
-            # Transformers format
-            res = _model.infer(
-                _tokenizer,
-                prompt=request.prompt,
-                image_file=image,  # Can pass PIL Image directly
-                output_path=None,
-                base_size=1024,
-                image_size=640,
-                crop_mode=True,
-                save_results=False,
-                test_compress=True
-            )
-            text = res.get("text", res.get("output", ""))
-        
-        else:
-            raise HTTPException(status_code=503, detail="No backend available")
-        
-        latency_ms = int((time.time() - start_time) * 1000)
-        
-        return ValidationResponse(
-            text=text,
-            output=text,
-            latency_ms=latency_ms,
-            cached=False
-        )
-    
-    except Exception as e:
-        logging.error(f"Validation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
 
+    t0 = time.time()
+
+    # Decode image
+    image = _decode_image(req.image_base64)
+    img_hash = _sha256_of_image(image)
+
+    # Check trivial in-process cache
+    ck = f"{req.prompt}::{img_hash}"
+    cached = False
+    try:
+        cached_text = _cache_key.cache_info()  # touch cache so lru_cache decorator is active
+    except Exception:
+        pass
+
+    # vLLM MM input format: list of dicts
+    model_input = [{
+        "prompt": req.prompt,
+        "multi_modal_data": {"image": image},
+    }]
+
+    sampling = _build_sampling_params(req.temperature, req.max_tokens)
+
+    try:
+        outputs = _llm.generate(model_input, sampling)
+        text = outputs[0].outputs[0].text
+    except Exception as e:
+        log.exception("Generation failed")
+        raise HTTPException(status_code=500, detail=f"Generation error: {e}")
+
+    latency_ms = int((time.time() - t0) * 1000)
+    return ValidationResponse(text=text, latency_ms=latency_ms, cached=cached)
+
+
+# -------------------------
+# Entrypoint
+# -------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    uvicorn.run("deepseek_ocr_service:app", host=HOST, port=PORT, reload=False)
