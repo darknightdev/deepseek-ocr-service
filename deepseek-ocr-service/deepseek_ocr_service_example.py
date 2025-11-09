@@ -1,72 +1,74 @@
 """
-DeepSeek-OCR FastAPI Service (Transformers-only)
-
-- Uses Hugging Face Transformers with trust_remote_code to load deepseek-ai/DeepSeek-OCR
-- Works on CUDA GPUs (A10/T4/L4/A100/etc.). Falls back to CPU if needed.
-- Picks dtype dynamically: bfloat16 if supported, else float16 on CUDA; float32 on CPU.
-- Optional: pin a model revision via env var DEEPSEEK_OCR_REV to avoid remote-code drift.
+DeepSeek-OCR Transformers-only FastAPI Service (slow tokenizer; GPU-friendly)
 
 Endpoints:
   GET  /healthz
-  POST /validate_piicrop  -> { image_base64, prompt, category?, temperature?, max_tokens? }
+  POST /validate_piicrop  { image_base64, prompt, category, temperature?, max_tokens? }
+
+Notes:
+- Forces slow (SentencePiece) tokenizer to avoid tokenizer.json fast-tokenizer errors.
+- Picks dtype automatically: T4 => fp16; A10/A100/L4 => bfloat16; CPU => float32.
+- Uses model's trust_remote_code .infer(...) method for OCR on image crops.
 """
 
-import base64
+import os
 import io
+import time
 import json
 import logging
-import os
-import time
+import base64
 from typing import Optional
 
+# Force slow tokenizer + stable behavior
+os.environ.setdefault("TRANSFORMERS_NO_FAST_TOKENIZER", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import torch
+from PIL import Image
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image
 
-import torch
-from transformers import AutoModel, AutoTokenizer, __version__ as hf_version
+from transformers import AutoModel, AutoTokenizer, LlamaTokenizer, __version__ as HF_VER
 
+# ----------------------------
+# Logging
+# ----------------------------
+logger = logging.getLogger("deepseek-ocr-service")
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-MODEL_ID = os.getenv("DEEPSEEK_OCR_MODEL", "deepseek-ai/DeepSeek-OCR")
-MODEL_REV = os.getenv("DEEPSEEK_OCR_REV")  # e.g., "9f30c71..." commit hash to pin
-ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")  # comma-separated list if you want to restrict
-CROP_BASE_SIZE = int(os.getenv("CROP_BASE_SIZE", "1024"))
-CROP_IMAGE_SIZE = int(os.getenv("CROP_IMAGE_SIZE", "640"))
-DEFAULT_MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
-DEFAULT_TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
+# ----------------------------
+# FastAPI app
+# ----------------------------
+app = FastAPI(title="DeepSeek-OCR PII Validation Service (Transformers-only)")
 
-
-# -----------------------------------------------------------------------------
-# FastAPI app & CORS (tighten in prod)
-# -----------------------------------------------------------------------------
-app = FastAPI(title="DeepSeek-OCR PII Validation Service (Transformers)")
-
-allow_origins = [o.strip() for o in ALLOW_ORIGINS.split(",")] if ALLOW_ORIGINS else ["*"]
+# Open up CORS for now; restrict to your IPs/domains in production.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
+    allow_origins=["*"],  # TODO: lock this down
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-logger = logging.getLogger("deepseek-ocr-service")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+# ----------------------------
+# Globals (model & tokenizer)
+# ----------------------------
+_model = None
+_tokenizer = None
+_device = "cpu"
+_dtype = torch.float32
 
 
-# -----------------------------------------------------------------------------
-# Request/Response models
-# -----------------------------------------------------------------------------
 class ValidationRequest(BaseModel):
     image_base64: str
     prompt: str
-    category: Optional[str] = None
-    temperature: float = DEFAULT_TEMPERATURE
-    max_tokens: int = DEFAULT_MAX_TOKENS
+    category: str
+    temperature: float = 0.0
+    max_tokens: int = 512
 
 
 class ValidationResponse(BaseModel):
@@ -74,157 +76,156 @@ class ValidationResponse(BaseModel):
     output: Optional[str] = None
     latency_ms: int
     cached: bool = False
-    backend: str = "transformers"
 
 
-# -----------------------------------------------------------------------------
-# Globals for model/tokenizer
-# -----------------------------------------------------------------------------
-_tokenizer = None
-_model = None
-_device = "cpu"
-_dtype = torch.float32
-
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def _select_device_and_dtype():
-    """Choose device and dtype based on availability/capability."""
+def _pick_device_and_dtype():
+    """
+    Decide device and dtype.
+    - If CUDA is available:
+        - If compute capability <= 7.x (e.g., T4=7.5) -> fp16
+        - Else (A10/A100/L4 and newer) -> bfloat16
+    - Else CPU -> float32
+    """
     if torch.cuda.is_available():
-        device = "cuda"
-        # T4 doesn't support bf16; A10/A100/L4 do. Pick the best we can.
-        if torch.cuda.is_bf16_supported():
-            dtype = torch.bfloat16
-        else:
-            dtype = torch.float16
-    else:
-        device = "cpu"
-        dtype = torch.float32
-    return device, dtype
+        try:
+            major, minor = torch.cuda.get_device_capability()
+            if major <= 7:
+                return "cuda", torch.float16
+            else:
+                return "cuda", torch.bfloat16
+        except Exception:
+            return "cuda", torch.float16
+    return "cpu", torch.float32
 
 
-def _load_deepseek_ocr():
-    """Load tokenizer & model via Transformers with trust_remote_code=True."""
-    global _tokenizer, _model, _device, _dtype
-
-    logger.info("Transformers version: %s", hf_version)
-    _device, _dtype = _select_device_and_dtype()
-    logger.info("Loading model on device=%s with dtype=%s", _device, str(_dtype).split(".")[-1])
-
-    model_ref = MODEL_ID if not MODEL_REV else f"{MODEL_ID}@{MODEL_REV}"
-
-    _tokenizer = AutoTokenizer.from_pretrained(
-        "deepseek-ai/DeepSeek-OCR",
-        trust_remote_code=True,
-        use_fast=False,       # <-- important
-    )
-    _model = AutoModel.from_pretrained(
-        "deepseek-ai/DeepSeek-OCR",
-        trust_remote_code=True,
-        torch_dtype=_dtype,   # bf16 on A100/L4; fp16 on T4
-    )
-
-    # Move to device and eval
-    if _device == "cuda":
-        _model = _model.to(_dtype).cuda().eval()
-    else:
-        _model = _model.to(_dtype).eval()
-
-    logger.info("DeepSeek-OCR loaded successfully: %s", model_ref)
-
-
-def _decode_image(b64: str) -> Image.Image:
+def _load_tokenizer(model_id: str):
+    """
+    Load slow tokenizer. Prefer AutoTokenizer(use_fast=False), fall back to LlamaTokenizer if needed.
+    """
     try:
-        image_bytes = base64.b64decode(b64)
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        return image
+        tok = AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            use_fast=False,   # critical: force slow tokenizer
+        )
+        return tok
+    except Exception as e:
+        logger.warning("AutoTokenizer slow failed: %s; falling back to LlamaTokenizer(use_fast=False)", e)
+        # LlamaTokenizer (slow) requires sentencepiece installed
+        tok = LlamaTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            use_fast=False,
+        )
+        return tok
+
+
+def _load_model_and_tokenizer():
+    global _model, _tokenizer, _device, _dtype
+
+    logger.info("Loading model (Transformers-only)...")
+    logger.info("Transformers version: %s", HF_VER)
+
+    _device, _dtype = _pick_device_and_dtype()
+    logger.info("Loading model on device=%s with dtype=%s", _device, _dtype)
+
+    model_id = os.environ.get("DEEPSEEK_OCR_MODEL", "deepseek-ai/DeepSeek-OCR")
+
+    # Tokenizer (slow)
+    _tokenizer_local = _load_tokenizer(model_id)
+
+    # Model
+    model = AutoModel.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        torch_dtype=_dtype,
+        low_cpu_mem_usage=True,
+        # revision=os.environ.get("DEEPSEEK_OCR_REVISION", None),  # optionally pin commit
+    )
+    model = model.eval().to(_device)
+
+    return model, _tokenizer_local
+
+
+@app.on_event("startup")
+def _startup():
+    global _model, _tokenizer
+    try:
+        _model, _tokenizer = _load_model_and_tokenizer()
+        logger.info("Model and tokenizer loaded successfully.")
+    except Exception as e:
+        logger.error("Failed to load model", exc_info=True)
+        raise
+
+
+@app.get("/healthz")
+def health_check():
+    if _model is None or _tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    # Minimal device info
+    info = {"status": "healthy", "transformers": HF_VER, "device": _device, "dtype": str(_dtype)}
+    if torch.cuda.is_available():
+        info["cuda_name"] = torch.cuda.get_device_name(0)
+    return info
+
+
+def _decode_image_b64(image_b64: str) -> Image.Image:
+    try:
+        raw = base64.b64decode(image_b64)
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        return img
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
 
 
-# -----------------------------------------------------------------------------
-# Lifecycle
-# -----------------------------------------------------------------------------
-@app.on_event("startup")
-def _startup():
-    try:
-        logger.info("Loading model (Transformers-only)...")
-        _load_deepseek_ocr()
-    except Exception as e:
-        logger.exception("Failed to load model")
-        # Let startup fail loudly so orchestration can restart
-        raise
-
-
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
-@app.get("/healthz")
-def healthz():
-    if _model is None or _tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    return {
-        "status": "healthy",
-        "backend": "transformers",
-        "device": _device,
-        "dtype": str(_dtype).split(".")[-1],
-        "model": MODEL_ID,
-        "revision": MODEL_REV or "latest",
-    }
-
-
 @app.post("/validate_piicrop", response_model=ValidationResponse)
-def validate_piicrop(req: ValidationRequest):
+def validate_pii_crop(request: ValidationRequest):
     """
-    Validate a PII candidate crop using DeepSeek-OCR.
-    Expects a cropped image (PIL) & a compact instruction/prompt.
+    Validate a PII candidate by OCRing a cropped image region with DeepSeek-OCR.
 
-    Returns OCR/LLM text output; your upstream pipeline will parse/assess it.
+    - The prompt should request faithful extraction (or a structured JSON verdict if you prefer).
+    - This endpoint returns the raw OCR text in 'text'/'output'.
     """
     if _model is None or _tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     start = time.time()
-
-    # Decode the image
-    image = _decode_image(req.image_base64)
-
-    # DeepSeek-OCR exposes .infer(tokenizer, prompt=..., image_file=..., ...)
-    # We pass PIL Image directly; remote code supports it.
     try:
-        res = _model.infer(
-            _tokenizer,
-            prompt=req.prompt,
-            image_file=image,      # PIL Image supported by remote code
-            output_path=None,
-            base_size=CROP_BASE_SIZE,
-            image_size=CROP_IMAGE_SIZE,
-            crop_mode=True,
-            save_results=False,
-            test_compress=True
-        )
-        # The repo returns a dict containing "text" and/or "output"
-        text = res.get("text") or res.get("output") or ""
+        image = _decode_image_b64(request.image_base64)
+
+        # DeepSeek-OCR exposes an .infer(...) method via trust_remote_code
+        # We keep conservative defaults for image sizes; adjust if needed.
+        with torch.no_grad():
+            res = _model.infer(
+                _tokenizer,
+                prompt=request.prompt,
+                image_file=image,      # PIL Image is accepted by DeepSeek-OCR trust_remote_code
+                output_path=None,
+                base_size=1024,        # internal long-side base size
+                image_size=640,        # model's processing size
+                crop_mode=True,        # we're sending a crop
+                save_results=False,
+                test_compress=True,    # let model try compressed representation for speed
+                temperature=request.temperature,
+                max_new_tokens=request.max_tokens,
+            )
+
+        # DeepSeek-OCR typically returns a dict with 'text' or 'output'
+        text = res.get("text", None)
+        if text is None:
+            text = res.get("output", "")
+
+        latency_ms = int((time.time() - start) * 1000)
+        return ValidationResponse(text=text, output=text, latency_ms=latency_ms, cached=False)
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("DeepSeek-OCR inference failed")
-        raise HTTPException(status_code=500, detail=f"Inference error: {e}")
-
-    latency_ms = int((time.time() - start) * 1000)
-    return ValidationResponse(
-        text=text,
-        output=text,
-        latency_ms=latency_ms,
-        cached=False,
-        backend="transformers",
-    )
+        logger.error("Validation error", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Validation failed: {e}")
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host=host, port=port)
+    # Example run: uvicorn deepseek_ocr_service_example:app --host 0.0.0.0 --port 8000
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
