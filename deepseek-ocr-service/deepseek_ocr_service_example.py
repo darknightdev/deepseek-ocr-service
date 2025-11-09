@@ -115,13 +115,14 @@ def _load_deepseek_ocr():
     model_ref = MODEL_ID if not MODEL_REV else f"{MODEL_ID}@{MODEL_REV}"
 
     _tokenizer = AutoTokenizer.from_pretrained(
-        model_ref,
-        trust_remote_code=True
+        "deepseek-ai/DeepSeek-OCR",
+        trust_remote_code=True,
+        use_fast=False,       # <-- important
     )
     _model = AutoModel.from_pretrained(
-        model_ref,
+        "deepseek-ai/DeepSeek-OCR",
         trust_remote_code=True,
-        torch_dtype=_dtype
+        torch_dtype=_dtype,   # bf16 on A100/L4; fp16 on T4
     )
 
     # Move to device and eval
